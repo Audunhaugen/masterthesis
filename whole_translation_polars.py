@@ -39,20 +39,21 @@ base = events_df
 ##################################### 20 : Accessioning #####################################
 
 to_append_fin = base.filter((pl.col('eventid') == 'AO') | ((pl.col('eventid') == 'ERF') & (pl.col('eventcategory') == '2'))).select(
-    pl.lit(20).alias('event_name'),
-    pl.lit(2).alias('event_type'),
-    pl.col('happened_at'),
-    pl.col('requisitionid'),
-    pl.col('requisitionid').alias('token_id'),
-    pl.lit(0).alias('token_type'),
-    pl.lit(2).alias('revision'),
-    pl.col('username'),
-    pl.col('workstation'),
-    pl.lit(None).cast(pl.Int32).alias('lab_ref')
+    pl.lit(20).alias('event_name'), # event_name 20 for accessioning
+    pl.lit(2).alias('event_type'), # event_type 2 for finished event
+    pl.col('happened_at'), # happened_at is the timestamp of the event
+    pl.col('requisitionid'), # requisitionid is the unique identifier for the accession
+    pl.col('requisitionid').alias('token_id'), # token_id is the unique identifier of a token, requisitionid as placeholder
+    pl.lit(0).alias('token_type'), # token_type 0 for case
+    pl.lit(2).alias('revision'), 
+    pl.col('username'), # username is the user who performed the event
+    pl.col('workstation'), # workstation is the workstation where the event was performed
+    pl.lit(None).cast(pl.Int32).alias('lab_ref') # lab_ref is unique identifier of the laboratory
 )
 
 finished_df = to_append_fin
 
+# join with access_df and find the earliest accession per requisition
 a = base.filter(pl.col('eventid') == 'AO').join(access_df, on='requisitionid').filter(
     (pl.col('happened_at') > pl.col('happened_at_right'))
 ).group_by('requisitionid').agg(
@@ -60,8 +61,10 @@ a = base.filter(pl.col('eventid') == 'AO').join(access_df, on='requisitionid').f
     pl.col('username_right').first().alias('username')
 ).with_columns(pl.lit('A').alias('type'))
 
+# preserve original timestamps and usernames
 b = base.filter(pl.col('eventid') == 'AO').select(pl.col('requisitionid'), pl.col('happened_at'), pl.col('username'), pl.lit('B').alias('type'))
 
+# manual requisitions
 c = base.filter(
     (pl.col('eventid') == 'ERF') & (pl.col('eventcategory') == '2')
 ).select(
@@ -73,6 +76,7 @@ c = base.filter(
 
 together = pl.concat([a, b, c])
 
+# Create a new dataframe with the previous event's timestamp, for the same username
 d = together.sort(['username', 'happened_at']).with_columns(
     pl.col('happened_at').shift(1).alias('n'),
     pl.col('username').shift(1).alias('a'),
@@ -153,8 +157,9 @@ to_append_start = access_df.join(grossing_fin, on=['requisitionid', 'username'])
 
 finished_df = pl.concat([finished_df, to_append_start])
 
-### Restmaterial - Archive (31+32)
+### 31 : SpecimenContainerArchived
 
+# Finding the latest event of type 'ARCH', marking as 'SpecimenContainerArchived'
 to_append_archived = base.filter(pl.col('eventid') == 'ARCH').filter(pl.col('info').str.contains(r"\S+ \S+ \d+ RESTMAT")).group_by(['requisitionid', 'username']).agg(pl.col('happened_at').max()).select(
     pl.lit(31).alias('event_name'),
     pl.lit(0).alias('event_type'), 
@@ -170,6 +175,9 @@ to_append_archived = base.filter(pl.col('eventid') == 'ARCH').filter(pl.col('inf
 
 finished_df = pl.concat([finished_df, to_append_archived])
 
+### 32 : SpecimenContainerRetrieved
+
+# Finding the earliest event of type 'DELA', marking as 'SpecimenContainerRetrieved'
 to_append_retrieved = base.filter(pl.col('eventid') == 'DELA').group_by(['requisitionid', 'username']).agg(pl.col('happened_at').min()).select(
     pl.lit(32).alias('event_name'),
     pl.lit(0).alias('event_type'), 
@@ -189,6 +197,7 @@ finished_df = pl.concat([finished_df, to_append_retrieved])
 
 proc = base.filter((pl.col('eventcategory') == 'FREM') & (pl.col('eventid') == 'START'))
 
+# extracting value of timer from status to determine stop events
 proc_base = proc.sort('happened_at').group_by(['requisitionid', 'tokenid']).agg(
     pl.col('happened_at').last(),
     pl.col('status').last(),
@@ -291,16 +300,8 @@ finished_df = pl.concat([finished_df, to_append])
 ##################################### 50 (51, 59) : Embedding #####################################
 emb_base = base.filter(pl.col('eventcategory').is_in({"STØP", 'KOORD',"IN_ATEK2_HBE" }))
 
-unknown_blocks = emb_base.select(
-    pl.col('requisitionid').alias('element_id'),
-    pl.lit(24).cast(pl.Int32).alias('issue_id'), 
-    pl.lit(2).cast(pl.Int32).alias('stage_no'),
-    pl.lit(datetime.now()).dt.cast_time_unit('ns').alias('trafo_ts'),
-    pl.col('happened_at').dt.replace_time_zone(None).alias('event_ts'),
-    pl.concat_str([pl.lit('Activity: 50/51/59; Token: '), pl.col('tokenid')]).alias('details')
-)
-
 ### 59 : koordinering
+# Finding the latest event of type 'KOORD' with eventid 'STOP', marking as instant activity
 to_add_coord = emb_base.filter(
     (pl.col('eventid') == 'STOP') & (pl.col('eventcategory') == 'KOORD')
 ).sort('happened_at').group_by('tokenid').agg(
@@ -349,6 +350,7 @@ aut_embd = emb_base.filter(
 
 aut_embd_base = emb_base.filter((pl.col('eventcategory').is_in({'STØP', 'IN_ATEK2_HBE'})) & (~(pl.col('status').is_in({'STØP'}))))
 
+# Extracting start and stop events for automatic embedding, respectively from the first and last occurrence of the eventid 'START' and 'STOP'
 aut_embd_starts = aut_embd_base.filter(pl.col('eventid') == 'START').group_by(['requisitionid', 'tokenid']).agg(
     pl.col('happened_at').min(),
     pl.col('username').first(),
@@ -388,6 +390,8 @@ finished_df = pl.concat([finished_df, aut_embd])
 ##################################### 60: sectioning #####################################
 
 def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: pl.DataFrame, open_start: bool) -> pl.DataFrame:
+    
+    # Group stop events by actor and indexing each group
     grouped = work.filter(pl.col('username') == actor_ref).filter(pl.col('eventid') == 'STOP').sort('happened_at').with_columns(
         pl.col('happened_at').shift(-1).alias('happened_at_next'),
     ).with_columns(
@@ -401,6 +405,9 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
     ).with_columns(
         pl.col('group').fill_null(0)
     )
+
+
+    # Groups are summarised to estimate how long the group took, and how much time for each token in the group
     if open_start:
         prelim = grouped.group_by('group').agg(
             pl.col('happened_at').min().alias('start'),
@@ -442,6 +449,7 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
             (pl.col('time_taken') / pl.col('count')).alias('per_item_new')
         )
 
+    # Final start and stop times are calculated based on the median time per item in the group
     if len(prelim) == 1:
         final_groups = prelim.select('group', 'start', 'stop')
     else:
@@ -471,6 +479,8 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
                  'start',
                 pl.when(pl.col('stop_new').is_not_null()).then(pl.col('stop_new')).otherwise(pl.col('alt_stop')).alias('stop'),
             )
+
+    # Create start and stop events based on the final groups
     starts = grouped.join(final_groups, on='group').select(
         pl.lit(60).alias('event_name'), 
         pl.lit(1).cast(pl.Int32).alias('event_type'),
@@ -511,11 +521,14 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
             pl.col('status') == 'SNMOLP'
         ).then(pl.lit(5)).otherwise(pl.lit(0)).cast(pl.Int32).alias('lab_ref')
     )
-    if len(starts) > 0 and len(stops) > 0:
-        return pl.concat([starts, stops])
-    else:
-        return starts # otherwise it is empty
 
+    if len(starts) > 0 and len(stops) > 0:
+        return pl.concat([starts, stops]) #final events are returned if both starts and stops are present
+    else:
+        return starts # otherwise return only starts
+
+
+# Function to translate events that are too quick
 def _translate_too_quick(work: pl.DataFrame, act: int) -> pl.DataFrame:
     new_events = work.filter(pl.col('username') == act).filter(pl.col('eventid') == 'STOP').select(
         pl.lit(60).alias('event_name'),
@@ -541,16 +554,6 @@ def _translate_too_quick(work: pl.DataFrame, act: int) -> pl.DataFrame:
 
 sect_base = base.filter(pl.col('eventcategory') == 'SECT')
 
-# should be empty
-unknown = sect_base.unique('tokenid').select(
-                pl.col('requisitionid').alias('element_id'),
-                pl.lit(24).cast(pl.Int32).alias('issue_id'),
-                pl.lit(2).cast(pl.Int32).alias('stage_no'),
-                pl.lit(datetime.now()).dt.cast_time_unit('ns').alias('trafo_ts'),
-                pl.col('happened_at').dt.replace_time_zone(None).alias('event_ts'),
-                pl.concat_str([pl.lit('Activity: 60; Token: '), pl.col('requisitionid')]).alias('details')
-)
-
 work = sect_base.select(
     'eventid',
     'requisitionid',
@@ -560,7 +563,7 @@ work = sect_base.select(
     'workstation',
 )
 
-# sigma table is the central part of the algorithm
+# Build per-user sigma_table with average time between stops
 sigma_table = work.filter(pl.col('eventid') == 'STOP').sort(['username', 'happened_at']).with_columns(
     pl.col('happened_at').shift(-1).alias('happened_at_next'),
     pl.col('username').shift(-1).alias('username_next')
@@ -624,16 +627,6 @@ finished_df = pl.concat([finished_df, new_events])
 
 farge_base = base.filter(pl.col('eventcategory') == 'FARG')
 
-# hopefully empty
-missing = farge_base.select(
-    pl.col('requisitionid').alias('element_id'),
-    pl.lit(25).cast(pl.Int32).alias('issue_id'), 
-    pl.lit(2).cast(pl.Int32).alias('stage_no'),
-    pl.lit(datetime.now()).dt.cast_time_unit('ns').alias('trafo_ts'),
-    pl.col('happened_at').dt.replace_time_zone(None).alias('event_ts'),
-    pl.concat_str([pl.lit('Activity: 70; Token: '), pl.col('tokenid')]).alias('details')
-)
-
 aut_stain_fin = farge_base.filter(pl.col('status') == 'IN-TTHIST').select(
     pl.lit(70).alias('event_name'), 
     pl.lit(2).alias('event_type'), 
@@ -649,6 +642,7 @@ aut_stain_fin = farge_base.filter(pl.col('status') == 'IN-TTHIST').select(
 
 finished_df = pl.concat([finished_df, aut_stain_fin])
 
+# automatic staining start events created 25 minutes before stop
 aut_stain_starts = farge_base.filter(pl.col('status') == 'IN-TTHIST').select(
     pl.lit(70).alias('event_name'), 
     pl.lit(1).alias('event_type'), 
@@ -714,6 +708,7 @@ scan_finished = scan_base.select(
 
 finished_df = pl.concat([finished_df, scan_finished])
 
+# duration of scanning set to 30 minutes
 scan_starts = scan_base.select(
     pl.lit(85).alias('event_name'), 
     pl.lit(1).alias('event_type'), 
@@ -738,15 +733,16 @@ disp_base = base.filter(
 disp_base = disp_base.select(
     pl.col('requisitionid'),
     pl.col('happened_at'),
-    pl.col('username').alias('dispatcher'),
-    pl.col('info').alias('dispatchee'),
+    pl.col('username').alias('dispatcher'), # actor who assigned the case
+    pl.col('info').alias('dispatchee') # To who the case was assigned
 )
-
+# Group by requisition and dispatchee to get the earliest dispatch per recipient
 disp_base = disp_base.sort('happened_at').group_by(['requisitionid', 'dispatchee']).agg(
     pl.col('happened_at').min(),
     pl.col('dispatcher').first(),
 )
 
+# event log entry for first dispatch per requisition
 to_append = disp_base.sort('happened_at').group_by('requisitionid').agg(
     pl.col('happened_at').first(),
     pl.col('dispatcher').first(),
@@ -756,7 +752,7 @@ to_append = disp_base.sort('happened_at').group_by('requisitionid').agg(
     pl.col('happened_at'),
     pl.col('requisitionid'),
     pl.col('requisitionid').alias('token_id'),
-    pl.lit(0).cast(pl.Int32).alias('token_type'), # case
+    pl.lit(0).cast(pl.Int32).alias('token_type'), 
     pl.lit(2).cast(pl.Int32).alias('revision'),
     pl.col('dispatcher').alias('username'),
     pl.lit(None).alias("workstation"),
@@ -765,17 +761,7 @@ to_append = disp_base.sort('happened_at').group_by('requisitionid').agg(
 
 finished_df = pl.concat([finished_df, to_append])
 
-to_append_worklist = disp_base.select(
-    pl.col('requisitionid'),
-    pl.col('dispatchee').alias('username'),
-    pl.col('happened_at').alias('valid_from'),
-    pl.lit(None).cast(pl.Datetime).alias('valid_until'),
-    pl.lit(0).cast(pl.Int32).alias('in_role') # Lege
-)
-
-combined_base = disp_base
-
-reassignments = combined_base
+reassignments = disp_base
 
 to_append = reassignments.select(
     pl.lit(81).alias('event_name'),
@@ -810,11 +796,14 @@ to_append = pl.concat([
 
 finished_df = pl.concat([finished_df, to_append])
 
+print(finished_df)
+
 print(f"Full translation execution time: {datetime.now() - start_time}")
 
 ### Query
 time = datetime.now()
 
 df = finished_df.filter(pl.col("requisitionid") == 17060286647797133986).sort('happened_at')
+print(df)
 
 print(f"Query execution time: {datetime.now() - time}")

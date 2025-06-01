@@ -62,6 +62,7 @@ finished_df = to_append_fin
 access_df = access_df.withColumnRenamed("happened_at", "happened_at_right").withColumnRenamed("username", "username_right")
 base = base.repartition("requisitionid")
 
+# join with access_df and find the earliest accession per requisition
 a = (
     base.filter(col('eventid') == 'AO')
     .join(access_df, 'requisitionid')
@@ -74,6 +75,7 @@ a = (
     .withColumn('type', lit('A'))
 )
 
+# preserve original timestamps and usernames
 b = (
     base.filter(col('eventid') == 'AO')
     .select(
@@ -84,6 +86,7 @@ b = (
     )
 )
 
+# manual requisitions
 c = (
     base.filter(
         (col('eventid') == 'ERF') & (col('eventcategory') == '2')
@@ -101,6 +104,7 @@ together = a.unionByName(b).unionByName(c)
 together = together.repartition("username")
 window_spec = Window.partitionBy("username").orderBy("happened_at")
 
+# Create a new dataframe with the previous event's timestamp, for the same username
 d = (
     together.select("requisitionid", "happened_at", "username", "type")
     .sort("username", "happened_at")
@@ -118,6 +122,7 @@ d = (
 together = together.unionByName(d)
 
 together = together.repartition("type")
+
 to_append_start = (
     together.filter(col("type").isin(["A", "D"]))
     .select(
@@ -199,6 +204,7 @@ finished_df = finished_df.unionByName(to_append)
 
 ### 31 : SpecimenContainerArchived
 
+# Finding the latest event of type 'ARCH', marking as 'SpecimenContainerArchived'
 archived = base.filter(
     (col("eventid") == "ARCH") &
     (col("info").rlike(r"\S+ \S+ \d+ RESTMAT"))
@@ -223,6 +229,7 @@ finished_df = finished_df.unionByName(to_append_archived).orderBy("happened_at")
 
 ### 32 : SpecimenContainerRetrieved
 
+# Finding the earliest event of type 'DELA', marking as 'SpecimenContainerRetrieved'
 retrieved = base.filter(
     col("eventid") == "DELA"
 ).groupBy("requisitionid", "username").agg(
@@ -250,6 +257,7 @@ proc = base.filter(
     (col("eventcategory") == "FREM") & (col("eventid") == "START")
 )
 
+# extracting value of timer from status to determine stop events
 proc_base = proc.groupBy("requisitionid", "tokenid").agg(
     last("happened_at", ignorenulls=True).alias("happened_at"),
     last("status", ignorenulls=True).alias("status"),
@@ -361,16 +369,8 @@ emb_base = base.filter(
     col("eventcategory").isin(["STØP", "KOORD", "IN_ATEK2_HBE"])
 )
 
-unknwon_blocks = emb_base.select(
-    col("requisitionid").alias("element_id"),
-    lit(24).cast("int").alias("issue_id"),  
-    lit(2).cast("int").alias("stage_no"),
-    lit(datetime.now()).cast("timestamp").alias("trafo_ts"),
-    col("happened_at").cast("timestamp").alias("event_ts"),
-    concat_ws("", lit("Activity: 50/51/59; Token: "), col("tokenid")).alias("details")
-)
-
 ### 59 : koordinering
+# Finding the latest event of type 'KOORD' with eventid 'STOP', marking as instant activity
 to_add_coord = emb_base.filter(
     (col("eventid") == "STOP") & (col("eventcategory") == "KOORD")
 ).groupBy("tokenid").agg(
@@ -472,10 +472,12 @@ finished_df = finished_df.unionByName(aut_embd_fins).orderBy("happened_at")
 ##################################### 60: sectioning #####################################
 
 def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: DataFrame, open_start: bool) -> DataFrame:
+    # Define a window over each technician's timeline
     w = Window.partitionBy("username").orderBy("happened_at")
 
     two_sigma_seconds = two_sigma.total_seconds()
 
+    # Filter STOP events for a given user and calculate time difference between each STOP and the next one
     grouped = work.filter(
         (col("username") == actor_ref) & (col("eventid") == "STOP")
     ).withColumn(
@@ -483,14 +485,14 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
     ).withColumn(
         "delta", col("happened_at_next").cast("long") - col("happened_at").cast("long")
     ).withColumn(
-        "is_new_group", col("delta") > lit(two_sigma_seconds)
+        "is_new_group", col("delta") > lit(two_sigma_seconds)  # Flag time gaps larger than threshold
     )
 
-    # Generate cumulative group numbers
+    # Convert boolean new-group flag to int, then sum to get group ids
     grouped = grouped.withColumn("is_new_group_int", when(col("is_new_group"), lit(1)).otherwise(lit(0)))
     grouped = grouped.withColumn("group", spark_sum("is_new_group_int").over(w))
 
-    # Aggregate prelim data by group
+    # Aggregate per-group statistics (start, stop, count)
     prelim = grouped.groupBy("group").agg(
         min("happened_at").alias("start"),
         max("happened_at").alias("stop"),
@@ -501,6 +503,7 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
         "per_item", (col("time_taken") / col("count")).cast("double")
     ).orderBy("group")
 
+    # Adjust timing if the start of a session is ambiguous or missing
     if open_start:
         prelim = prelim.withColumn("start_next", lead("start").over(Window.partitionBy("group").orderBy("start")))
         prelim = prelim.withColumn("delta", col("start_next").cast("long") - col("stop").cast("long"))
@@ -514,21 +517,24 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
         prelim = prelim.withColumn("time_taken_new", col("time_taken") + col("delta_next"))
         prelim = prelim.withColumn("per_item_new", (col("time_taken_new") / col("count")).cast("double"))
 
+    # Fallback for small datasets (only one group)
     if prelim.count() == 1:
         final_groups = prelim.select("group", "start", "stop")
     else:
+        # Estimate typical per-item time across groups, capped at 30 minutes
         if "per_item_new" in prelim.columns:
             x_vals = prelim.approxQuantile("per_item_new", [0.5], 0.01)
-            if x_vals:  # If non-empty list
-                x = round(builtins.min(x_vals[0], 1800)) # setting a cut-off at 1800s (i.e. 30min --> one should not spend more than half an hour on a block)
+            if x_vals:
+                x = round(builtins.min(x_vals[0], 1800))
             else:
                 print("WARN: approxQuantile returned empty list — falling back to default")
                 x = 60
         else:
             print("WARN: Column per_item_new missing — falling back to default")
             x = 60
-            x = round(builtins.min(x, 1800))  # clamp at 30min
+            x = round(builtins.min(x, 1800))
 
+        # Adjust start or stop times using estimated duration
         if open_start:
             final_groups = prelim.withColumn(
                 "start_next", lead("stop").over(Window.partitionBy("group").orderBy("stop"))
@@ -550,9 +556,10 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
                 "stop", when(col("stop_new").isNotNull(), col("stop_new")).otherwise(col("alt_stop"))
             ).select("group", "start", "stop")
 
-    # Join back and create events
+    # Join adjusted group times back to the original stop events
     enriched = grouped.join(final_groups, on="group")
 
+    # Helper to create synthetic event records
     def make_event_df(enriched, time_col: str, event_type: int) -> DataFrame:
         return enriched.select(
             lit(60).alias("event_name"),
@@ -571,21 +578,23 @@ def _make_sectioning_group_mappings(actor_ref: int, two_sigma: timedelta, work: 
             .otherwise(lit(0)).cast("int").alias("lab_ref")
         )
 
+    # Create start and stop events from enriched timeline
     starts = make_event_df(enriched, "start", 1)
     stops = make_event_df(enriched, "stop", 2)
 
     return starts.unionByName(stops) if starts.count() > 0 and stops.count() > 0 else starts
 
 def _translate_too_quick(work: DataFrame, act: int) -> DataFrame:
+    # Create synthetic start events from raw stop events for fast operators
     new_events = work.filter(
         (col("username") == act) & (col("eventid") == "STOP")
     ).select(
-        lit(60).alias("event_name"),             
-        lit(1).cast("int").alias("event_type"),  
+        lit(60).alias("event_name"),
+        lit(1).cast("int").alias("event_type"),
         col("happened_at"),
         col("requisitionid"),
         col("tokenid").alias("token_id"),
-        lit(2).alias("token_type"),           
+        lit(2).alias("token_type"),
         lit(2).alias("revision"),
         col("username"),
         col("workstation"),
@@ -595,22 +604,9 @@ def _translate_too_quick(work: DataFrame, act: int) -> DataFrame:
         .when(col("status") == "SNMOLP", lit(5))
         .otherwise(lit(0)).cast("int").alias("lab_ref")
     )
-
     return new_events
 
 sect_base = base.filter(col('eventcategory') == 'SECT')
-
-time = datetime.now()
-
-# should be empty
-unknown = sect_base.dropDuplicates(['tokenid']).select(
-                col('requisitionid').alias('element_id'),
-                lit(24).cast("int").alias('issue_id'),
-                lit(2).cast("int").alias('stage_no'),
-                lit(time).alias('trafo_ts'),
-                col('happened_at').alias('event_ts'),
-                concat_ws("", lit('Activity: 60; Token: '), col('tokenid')).alias('details')
-)
 
 work = sect_base.select(
     'tokenid',
@@ -622,13 +618,9 @@ work = sect_base.select(
     'workstation',
 )
 
-# Define window over each user ordered by time
+# Build per-user sigma_table with average time between stops
 w = Window.partitionBy("username").orderBy("happened_at")
-
-# Add next timestamp and username to calculate duration
-sigma_table = work.filter(
-    col("eventid") == "STOP"
-).withColumn(
+sigma_table = work.filter(col("eventid") == "STOP").withColumn(
     "happened_at_next", lead("happened_at").over(w)
 ).withColumn(
     "username_next", lead("username").over(w)
@@ -639,33 +631,12 @@ sigma_table = work.filter(
 ).groupBy("username").agg(
     mean("duration").alias("duration_mean"),
     first("status", ignorenulls=True).alias("status")
-)
+).withColumn("row_index", col("username").cast("int"))
 
-# Add row index (if needed)
-sigma_table = sigma_table.withColumn("row_index", col("username").cast("int"))  # placeholder if true indexing needed
-
-sigma_rows = sigma_table.collect()
-
-# Pick the nth entry
-n = 2
-if n < len(sigma_rows):
-    row = sigma_rows[n]
-    act = row["username"]
-    delta = timedelta(seconds=row["duration_mean"])
-    department = row["status"]
-else:
-    act, delta, department = None, None, None
-
-# histology (SNHIST, SNHISTSTOR)
-new_events = _make_sectioning_group_mappings(act, delta, work, True)
-
-# if is too quick (i.e. delta smaller than 30 seconds)
-new_events = _translate_too_quick(work, act)
-
-# Collect all rows to process in Python
+# Convert table to list of rows
 rows = sigma_table.collect()
 
-# Accumulate all event DataFrames
+# Collect translated events from each user
 to_append = []
 
 for r in rows:
@@ -676,29 +647,32 @@ for r in rows:
    if delta is None or seksjon is None:
        continue
 
-   # Convert delta to timedelta
    delta_td = timedelta(seconds=delta)
 
+   # If execution is fast but not unrealistic, double the estimate
    if timedelta(seconds=30) <= delta_td < timedelta(minutes=15):
        delta_td *= 2
 
+   # Molpat is excluded from translation
    if seksjon == "SNMOLP":
-       continue  # Skip molpat
+       continue
    elif delta_td < timedelta(seconds=30):
-       # those who are too quick, scan all the blocks and cut them later
+       # Very fast work — assume all items are scanned, not cut yet
        new_events = _translate_too_quick(work, act)
        if new_events.count() > 0:
            to_append.append(new_events)
    elif seksjon in {"SNHIST", "SNHISTSTOR"}:
+       # Histology — start might be ambiguous
        new_events = _make_sectioning_group_mappings(act, delta_td, work, True)
        if new_events.count() > 0:
            to_append.append(new_events)
    else:
+       # Other departments
        new_events = _make_sectioning_group_mappings(act, delta_td, work, False)
        if new_events.count() > 0:
            to_append.append(new_events)
 
-# Final concatenation
+# Merge all translated event blocks into one dataframe
 if len(to_append) > 1:
     new_events = to_append[0]
     for df in to_append[1:]:
@@ -709,21 +683,13 @@ else:
     print("WARN: there were no sectioning events translated!")
     new_events = None
 
+# Append to final output
 finished_df = finished_df.unionByName(new_events)
+
 
 ##################################### 70: staining #####################################
 
 farge_base = base.filter(col('eventcategory') == 'FARG')
-
-# hopefully empty
-missing = farge_base.select(
-    col("requisitionid").alias("element_id"),
-    lit(25).cast("int").alias("issue_id"),       
-    lit(2).cast("int").alias("stage_no"),
-    lit(datetime.now()).cast("timestamp").alias("trafo_ts"),
-    col("happened_at").cast("timestamp").alias("event_ts"),
-    concat_ws("", lit("Activity: 70; Token: "), col("tokenid")).alias("details")
-)
 
 aut_stain_fin = farge_base.filter(
     col("status") == "IN-TTHIST"
@@ -742,10 +708,10 @@ aut_stain_fin = farge_base.filter(
 
 finished_df = finished_df.unionByName(aut_stain_fin)
 
-aut_stain_starts = (
-    farge_base
-    .filter(col("status") == "IN-TTHIST")
-    .select(
+# automatic staining start events created 25 minutes before stop
+aut_stain_starts = farge_base.filter(
+    col("status") == "IN-TTHIST"
+).select(
         lit(70).alias("event_name"), 
         lit(1).cast(IntegerType()).alias("event_type"),  
         (col("happened_at") - expr("INTERVAL 25 MINUTES")).cast(TimestampType()).alias("happened_at"),
@@ -756,7 +722,6 @@ aut_stain_starts = (
         col("username"),
         col("workstation"),
         lit(0).cast(IntegerType()).alias("lab_ref") 
-    )
 )
 
 finished_df = finished_df.unionByName(aut_stain_starts)
@@ -818,6 +783,7 @@ scan_finished = (
 
 finished_df = finished_df.unionByName(scan_finished)
 
+# duration of scanning set to 30 minutes
 scan_starts = (
     scan_base.select(
         lit(85).alias("event_name"), 
@@ -843,15 +809,17 @@ disp_base = base.filter(
 disp_base = disp_base.select(
     col("requisitionid"),
     col("happened_at"),
-    col("username").alias("dispatcher"),
-    col("info").alias("dispatchee")
+    col("username").alias("dispatcher"), # actor who assigned the case
+    col("info").alias("dispatchee") # To who the case was assigned
 )
 
+# Group by requisition and dispatchee to get the earliest dispatch per recipient
 disp_base = disp_base.groupBy("requisitionid", "dispatchee").agg(
     min("happened_at").alias("happened_at"),
     first("dispatcher", ignorenulls=True).alias("dispatcher")
 )
 
+# event log entry for first dispatch per requisition
 to_append = disp_base.groupBy("requisitionid").agg(
     first("happened_at", ignorenulls=True).alias("happened_at"),
     first("dispatcher", ignorenulls=True).alias("dispatcher")
@@ -870,16 +838,7 @@ to_append = disp_base.groupBy("requisitionid").agg(
 
 finished_df = finished_df.unionByName(to_append).orderBy("happened_at")
 
-to_append_worklist = disp_base.select(
-    col("requisitionid"),
-    col("dispatchee").alias("username"),
-    col("happened_at").alias("valid_from"),
-    lit(None).cast("timestamp").alias("valid_until"),
-    lit(0).cast("int").alias("in_role")
-    )
-
-combined_base = disp_base
-reassignments = combined_base
+reassignments = disp_base
 
 to_append = reassignments.select(
     lit(81).alias('event_name'),
@@ -898,6 +857,7 @@ to_append = to_append.withColumn("event_type", col("event_type").cast("int"))
 
 finished_df = finished_df.unionByName(to_append).orderBy("happened_at")
 
+# fix type issue specific to spark
 reassignments_fixed = reassignments.select(
     lit(81).cast("int").alias('event_name'),
     lit(0).cast("int").alias('event_type'),

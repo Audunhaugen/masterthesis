@@ -50,16 +50,16 @@ base = events_df
 to_append_fin = base.filter(
     (col('eventid') == 'AO') | ((col('eventid') == 'ERF') & (col('eventcategory') == '2'))
 ).select(
-    lit(20).alias('event_name'),
-    lit(2).alias('event_type'),
-    col('happened_at'),
-    col('requisitionid'),
-    col('requisitionid').alias('token_id'),
-    lit(0).alias('token_type'),
-    lit(2).alias('revision'),
-    col('username'),
-    col('workstation'),
-    lit(None).cast(IntegerType()).alias('lab_ref')
+    lit(20).alias('event_name'), # event_name 20 for accessioning
+    lit(2).alias('event_type'), # event_type 2 for finished event
+    col('happened_at'), # happened_at is the timestamp of the event
+    col('requisitionid'), # requisitionid is the unique identifier for the accession
+    col('requisitionid').alias('token_id'), # token_id is the unique identifier of a token, requisitionid as placeholder
+    lit(0).alias('token_type'), # token_type 0 for case
+    lit(2).alias('revision'), 
+    col('username'), # username is the user who performed the event
+    col('workstation'), # workstation is the workstation where the event was performed
+    lit(None).cast(IntegerType()).alias('lab_ref') # lab_ref is unique identifier of the laboratory
 )
 
 finished_df = to_append_fin
@@ -71,6 +71,7 @@ access_df = access_df.withColumnRenamed("happened_at", "happened_at_right").with
 base = base.repartition("requisitionid")
 
 
+# join with access_df and find the earliest accession per requisition
 a = (
     base.filter(col('eventid') == 'AO')
     .join(access_df, 'requisitionid')
@@ -83,6 +84,7 @@ a = (
     .withColumn('type', lit('A'))
 )
 
+# preserve original timestamps and usernames
 b = (
     base.filter(col('eventid') == 'AO')
     .select(
@@ -93,6 +95,7 @@ b = (
     )
 )
 
+# manual requisitions
 c = (
     base.filter(
         (col('eventid') == 'ERF') & (col('eventcategory') == '2')
@@ -113,6 +116,7 @@ print("Above is accessioning type A, B and C, with length " + str(together.count
 together = together.repartition("username")
 window_spec = Window.partitionBy("username").orderBy("happened_at")
 
+# Create a new dataframe with the previous event's timestamp, for the same username
 d = (
     together.select("requisitionid", "happened_at", "username", "type")
     .sort("username", "happened_at")

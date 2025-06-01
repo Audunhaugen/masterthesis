@@ -60,6 +60,7 @@ print(finished_df)
 print("Above is 10 first lines of finished accession added to finished_df with total length " + str(finished_df.height))
 
 
+# join with access_df and find the earliest accession per requisition
 a = base.filter(pl.col('eventid') == 'AO').join(access_df, on='requisitionid').filter(
     (pl.col('happened_at') > pl.col('happened_at_right'))
 ).group_by('requisitionid').agg(
@@ -67,8 +68,10 @@ a = base.filter(pl.col('eventid') == 'AO').join(access_df, on='requisitionid').f
     pl.col('username_right').first().alias('username')
 ).with_columns(pl.lit('A').alias('type'))
 
+# preserve original timestamps and usernames
 b = base.filter(pl.col('eventid') == 'AO').select(pl.col('requisitionid'), pl.col('happened_at'), pl.col('username'), pl.lit('B').alias('type'))
 
+# manual requisitions
 c = base.filter(
     (pl.col('eventid') == 'ERF') & (pl.col('eventcategory') == '2')
 ).select(
@@ -84,6 +87,7 @@ print(together)
 print("Above is accessioning type A, B and C, with length " + str(together.height))
 
 
+# Create a new dataframe with the previous event's timestamp, for the same username
 d = together.sort(['username', 'happened_at']).with_columns(
     pl.col('happened_at').shift(1).alias('n'),
     pl.col('username').shift(1).alias('a'),
